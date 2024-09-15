@@ -3,30 +3,44 @@
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
     #include "Wire.h"
 #endif
+
+MPU6050 mpu;
+
+#define OUTPUT_READABLE_YAWPITCHROLL
+#define OUTPUT_TEAPOT
+#define INTERRUPT_PIN 2  // use pin 2 on Arduino Uno & most boards
+#define LED_PIN 13 // (Arduino is 13, Teensy is 11, Teensy++ is 6)
+bool blinkState = false;
+
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float euler[3];         // [psi, theta, phi]    Euler angle container
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
+// packet structure for InvenSense teapot demo
+uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\n' };
+float FSCSpacket[4];
+
+
+volatile bool mpuInterrupt = false;     
 #include <Servo.h>
 
-// Initialize MPU6050 and Servo objects
-MPU6050 mpu;
+// Initialize MPU6050 and Servo
 Servo rudder;     // Rudder controls the yaw
 Servo elevator;   // Elevator controls the pitch
 Servo aileron;    // Aileron controls the roll
-
-#define INTERRUPT_PIN 2 // Connect INT pin on MPU6050 to D2
-#define LED_PIN 13      // (Arduino is 13, Teensy is 11, Teensy++ is 6)
-
-// Flags and variables
-bool blinkState = false;
-bool dmpReady = false; // True if DMP initialization was successful
-uint8_t mpuIntStatus;  // Holds actual interrupt status byte from MPU
-uint8_t devStatus;     // Return status after each device operation (0 = success, !0 = error)
-uint16_t packetSize;   // Expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount;    // Count of all bytes currently in FIFO
-uint8_t fifoBuffer[64]; // FIFO storage buffer
-Quaternion q;          // [w, x, y, z] quaternion container
-VectorFloat gravity;   // [x, y, z] gravity vector
-float ypr[3];          // [yaw, pitch, roll] container
-
-volatile bool mpuInterrupt = false; // Indicates whether MPU interrupt pin has gone high
 
 // PID constants for yaw, pitch, and roll (adjust the gain as per your system)
 float Kp = 2.0;     // Proportional gain
@@ -49,102 +63,98 @@ float lastRollError = 0;
 unsigned long lastTime = 0;
 
 // Acceleration variables
-float axyz[3];   //[Accel_x,Accel_y,Accel_z] container
-
+float axyz[3];
 void dmpDataReady() {
     mpuInterrupt = true;
 }
 
+
+
+// ================================================================
+// ===                      INITIAL SETUP                       ===
+// ================================================================
+
 void setup() {
-    // Initialize I2C
+    // join I2C bus (I2Cdev library doesn't do this automatically)
     #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
         Wire.begin();
-        Wire.setClock(400000); // 400kHz I2C clock
+        Wire.setClock(400000); // 400kHz I2C clock. Comment this line if having compilation difficulties
     #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
         Fastwire::setup(400, true);
     #endif
 
-    // Initialize serial communication
     Serial.begin(115200);
-    while (!Serial); // Wait for Leonardo enumeration, others continue immediately
+    while (!Serial); // wait for Leonardo enumeration, others continue immediately
 
-    // Initialize MPU6050
+    // initialize device
     Serial.println(F("Initializing I2C devices..."));
     mpu.initialize();
     pinMode(INTERRUPT_PIN, INPUT);
 
-    // Verify connection
+    // verify connection
     Serial.println(F("Testing device connections..."));
     Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
 
-    // Wait for user input
+    // wait for ready
     Serial.println(F("\nSend any character to begin DMP programming and demo: "));
-    while (Serial.available() && Serial.read()); // Empty buffer
-    while (!Serial.available()); // Wait for data
-    while (Serial.available() && Serial.read()); // Empty buffer again
+    while (Serial.available() && Serial.read()); // empty buffer
+    while (!Serial.available());                 // wait for data
+    while (Serial.available() && Serial.read()); // empty buffer again
 
-    // Load and configure the DMP
+    // load and configure the DMP
     Serial.println(F("Initializing DMP..."));
     devStatus = mpu.dmpInitialize();
 
-    // Supply your own gyro offsets here
+    // supply your own gyro offsets here, scaled for min sensitivity
     mpu.setXGyroOffset(220);
     mpu.setYGyroOffset(76);
     mpu.setZGyroOffset(-85);
-    mpu.setZAccelOffset(1788); // Factory default for my test chip
+    mpu.setZAccelOffset(1788); // 1688 factory default for my test chip
 
+    // make sure it worked (returns 0 if so)
     if (devStatus == 0) {
-        // Calibration
+        // Calibration Time: generate offsets and calibrate our MPU6050
         mpu.CalibrateAccel(6);
         mpu.CalibrateGyro(6);
-
-        // Enable the DMP
+        mpu.PrintActiveOffsets();
+        // turn on the DMP, now that it's ready
         Serial.println(F("Enabling DMP..."));
         mpu.setDMPEnabled(true);
 
-        // Enable Arduino interrupt detection
+        // enable Arduino interrupt detection
         Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
         Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
         Serial.println(F(")..."));
         attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
         mpuIntStatus = mpu.getIntStatus();
 
-        // Set DMP Ready flag
+        // set our DMP Ready flag so the main loop() function knows it's okay to use it
         Serial.println(F("DMP ready! Waiting for first interrupt..."));
         dmpReady = true;
 
-        // Get expected DMP packet size
+        // get expected DMP packet size for later comparison
         packetSize = mpu.dmpGetFIFOPacketSize();
     } else {
-        // Error
         Serial.print(F("DMP Initialization failed (code "));
         Serial.print(devStatus);
         Serial.println(F(")"));
     }
 
-    // Initialize servos
-    rudder.attach(9);    // Attach servo to pin 9 for yaw control
-    elevator.attach(10); // Attach servo to pin 10 for pitch control
-    aileron.attach(11);  // Attach servo to pin 11 for roll control
-
-    // Set servos to middle position initially
-    rudder.write(90);
-    elevator.write(90);
-    aileron.write(90);
-
-    // Configure LED for output
+    // configure LED for output
     pinMode(LED_PIN, OUTPUT);
-
-    // Initialize timing for PID calculations
-    lastTime = millis();
 }
 
-void loop() {
-    if (!dmpReady) return;
 
-    // Read a packet from FIFO
-    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-        // Get the quaternion and calculate yaw, pitch, and roll
+
+// ================================================================
+// ===                    MAIN PROGRAM LOOP                     ===
+// ================================================================
+
+void loop() {
+    // if programming failed, don't try to do anything
+    if (!dmpReady) return;
+    // read a packet from FIFO
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) { // Get the Latest packet
         mpu.dmpGetQuaternion(&q, fifoBuffer);
         mpu.dmpGetGravity(&gravity, &q);
         mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
@@ -158,62 +168,37 @@ void loop() {
         unsigned long currentTime = millis();
         float dt = (currentTime - lastTime) / 1000.0;
         lastTime = currentTime;
-
-        // Read accelerometer values
-        VectorInt16 accel;
-        mpu.getAcceleration(&accel.x, &accel.y, &accel.z);
-
-        // Convert to g's
-        axyz[0] = accel.x / 16384.0; //this value is calculated using the gyroscopes resolution
-        axyz[1] = accel.y / 16384.0;
-        axyz[2] = accel.z / 16384.0;
-
-        // Convert to m/s² (assuming g = 9.81 m/s²)
-        axyz[0] *= 9.81;
-        axyz[1] *= 9.81;
-        axyz[2] *= 9.81;
-
-        // PID calculations for Yaw
-        float yawError = targetYaw - yaw;
-        yawIntegral += yawError * dt;
-        float yawDerivative = (yawError - lastYawError) / dt;
-        float yawOutput = Kp * yawError + Ki * yawIntegral + Kd * yawDerivative;
-        lastYawError = yawError;
-
-        // PID calculations for Pitch
-        float pitchError = targetPitch - pitch;
-        pitchIntegral += pitchError * dt;
-        float pitchDerivative = (pitchError - lastPitchError) / dt;
-        float pitchOutput = Kp * pitchError + Ki * pitchIntegral + Kd * pitchDerivative;
-        lastPitchError = pitchError;
-
-        // PID calculations for Roll
-        float rollError = targetRoll - roll;
-        rollIntegral += rollError * dt;
-        float rollDerivative = (rollError - lastRollError) / dt;
-        float rollOutput = Kp * rollError + Ki * rollIntegral + Kd * rollDerivative;
-        lastRollError = rollError;
-
-        // Map PID outputs to servo angles (0-180 degrees)
-        int rudderPos = map(yawOutput, -180, 180, 0, 180);
-        int elevatorPos = map(pitchOutput, -90, 90, 0, 180); 
-        int aileronPos = map(rollOutput, -180, 180, 0, 180);
-
-        // Write the servo positions
-        rudder.write(constrain(rudderPos, 0, 180));
-        elevator.write(constrain(elevatorPos, 0, 180));
-        aileron.write(constrain(aileronPos, 0, 180));
-
         // Blink LED to indicate activity
         blinkState = !blinkState;
         digitalWrite(LED_PIN, blinkState);
 
-        // Print Yaw, Pitch, and Roll for debugging
-        Serial.print("Yaw: "); Serial.print(yaw);
-        Serial.print(" Pitch: "); Serial.print(pitch);
-        Serial.print(" Roll: "); Serial.print(roll);
-        Serial.print(" Accel X: "); Serial.print(axyz[0]);
-        Serial.print(" Accel Y: "); Serial.print(axyz[1]);
-        Serial.print(" Accel Z: "); Serial.println(axyz[2]);
+        #ifdef OUTPUT_TEAPOT
+            // display quaternion values in InvenSense Teapot demo format:
+            teapotPacket[2] = fifoBuffer[0];
+            teapotPacket[3] = fifoBuffer[1];
+            teapotPacket[4] = fifoBuffer[4];
+            teapotPacket[5] = fifoBuffer[5];
+            teapotPacket[6] = fifoBuffer[8];
+            teapotPacket[7] = fifoBuffer[9];
+            teapotPacket[8] = fifoBuffer[12];
+            teapotPacket[9] = fifoBuffer[13];
+            Serial.write(teapotPacket, 14);
+            teapotPacket[11]++; // packetCount, loops at 0xFF on purpose
+        #endif
+/*        Serial.print(yaw);
+        FSCSpacket[2] = yaw;
+        FSCSpacket[3] = roll;
+        FSCSpacket[4] = pitch;
+        Serial.write(FSCSpacket,4);
+        Serial.print(" ");
+        Serial.print(FSCSpacket[2]);
+        Serial.print(" ");
+        Serial.print(FSCSpacket[3]);
+        Serial.print(" ");
+        Serial.println(FSCSpacket[4]);
+*/
+        // blink LED to indicate activity
+        blinkState = !blinkState;
+        digitalWrite(LED_PIN, blinkState);
     }
 }
